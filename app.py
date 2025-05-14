@@ -5,6 +5,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from scipy.io import wavfile
 import os
+import queue
+import threading
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -53,33 +55,41 @@ def apply_filters(audio_data):
     return audio * volume  # Aplica el volumen global
 
 def audio_callback(indata, outdata, frames, time, status):
-    """Callback para procesamiento de audio en tiempo real."""
+    """Callback for processing audio in real time."""
     global file_position, audio_file, is_playing_file, last_audio_chunk
 
-    if status:
-        print(f"Error en el stream: {status}")
+    try:
+        if status:
+            # Log the error but don't print it (to avoid console spam)
+            pass
 
-    if is_playing_file and audio_file is not None:
-        remaining_samples = len(audio_file) - file_position
-        if remaining_samples <= 0:
-            outdata[:] = np.zeros((frames, 1))
-            is_playing_file = False
-            btn_play_file.config(text="Reproducir Archivo")
-            return
-        chunk = audio_file[file_position:file_position + frames]
-        file_position += len(chunk)
-        if len(chunk) < frames:
-            chunk = np.pad(chunk, (0, frames - len(chunk)), 'constant', constant_values=0)  # Evita clicks
-        processed_audio = apply_filters(chunk)
-        outdata[:] = processed_audio.reshape(-1, 1)
-        last_audio_chunk = processed_audio
-    else:
-        if indata.any():
-            processed_audio = apply_filters(indata[:, 0])
+        if is_playing_file and audio_file is not None:
+            remaining_samples = len(audio_file) - file_position
+            if remaining_samples <= 0:
+                outdata.fill(0)
+                is_playing_file = False
+                root.after(0, lambda: btn_play_file.config(text="Reproducir Archivo"))
+                return
+
+            chunk = audio_file[file_position:file_position + frames]
+            file_position += len(chunk)
+            if len(chunk) < frames:
+                chunk = np.pad(chunk, (0, frames - len(chunk)))
+            processed_audio = apply_filters(chunk)
             outdata[:] = processed_audio.reshape(-1, 1)
             last_audio_chunk = processed_audio
         else:
-            outdata[:] = np.zeros((frames, 1))
+            if np.any(indata):
+                processed_audio = apply_filters(indata[:, 0])
+                outdata[:] = processed_audio.reshape(-1, 1)
+                last_audio_chunk = processed_audio
+            else:
+                outdata.fill(0)
+
+    except Exception as e:
+        # In case of any error, fill output with silence
+        outdata.fill(0)
+        print(f"Error in audio callback: {str(e)}")
 
 def load_audio_file():
     """Carga un archivo de audio y lo normaliza."""
@@ -122,20 +132,29 @@ def toggle_live_processing():
     global stream
     if stream is None:
         try:
+            # Configure stream with larger buffer size and lower latency
             stream = sd.Stream(
                 callback=audio_callback,
                 blocksize=block_size,
                 samplerate=fs,
-                channels=1
+                channels=1,
+                dtype=np.float32,
+                latency='high',  # Use high latency for better stability
+                device=None,     # Use default device
             )
             stream.start()
             btn_live.config(text="Detener Micrófono")
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo iniciar el micrófono: {e}")
     else:
-        stream.stop()
-        stream = None
-        btn_live.config(text="Iniciar Micrófono")
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            print(f"Error closing stream: {e}")
+        finally:
+            stream = None
+            btn_live.config(text="Iniciar Micrófono")
 
 def export_audio():
     """Exporta el audio procesado a un archivo WAV."""
@@ -166,16 +185,22 @@ def update_volume(val):
 
 def update_spectrum():
     """Actualiza el espectro de frecuencia en tiempo real."""
-    if np.any(last_audio_chunk):
-        fft_data = np.abs(np.fft.rfft(last_audio_chunk))
-        fft_data /= np.max(fft_data) if np.max(fft_data) > 0 else 1.0
-        freqs = np.fft.rfftfreq(len(last_audio_chunk), 1/fs)
-        line.set_data(freqs, fft_data)
-        ax.set_xlim(0, fs/2)
-        ax.set_ylim(0, 1)
-        canvas.draw()
-    root.after(100, update_spectrum)
-
+    try:
+        if np.any(last_audio_chunk):
+            # Reduce FFT size for better performance
+            fft_size = min(len(last_audio_chunk), 1024)
+            fft_data = np.abs(np.fft.rfft(last_audio_chunk[:fft_size]))
+            fft_data = fft_data / (np.max(fft_data) or 1.0)
+            freqs = np.fft.rfftfreq(fft_size, 1/fs)
+            
+            # Update plot data
+            line.set_data(freqs, fft_data)
+            canvas.draw_idle()  # Use draw_idle instead of draw for better performance
+    except Exception as e:
+        print(f"Error updating spectrum: {e}")
+    finally:
+        # Update less frequently to reduce CPU load
+        root.after(200, update_spectrum)  # Changed from 100ms to 200ms
 # --- Interfaz gráfica ---
 root = tk.Tk()
 root.title("Ecualizador Digital - ITCR")
