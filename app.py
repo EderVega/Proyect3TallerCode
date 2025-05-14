@@ -211,11 +211,14 @@ btn_live.pack()
 # Sección de volumen
 volume_frame = ttk.LabelFrame(main_frame, text="Volumen", padding="10")
 volume_frame.pack(fill=tk.X, pady=5)
+
+lbl_volume = ttk.Label(volume_frame, text="Volumen: 100%")  # <-- Mueve esta línea antes
+lbl_volume.pack()
+
 slider_volume = ttk.Scale(volume_frame, from_=0.0, to=1.0, orient="horizontal", command=update_volume)
 slider_volume.set(1.0)
 slider_volume.pack(fill=tk.X, padx=5, pady=2)
-lbl_volume = ttk.Label(volume_frame, text="Volumen: 100%")
-lbl_volume.pack()
+
 
 # Sección de filtros
 filters_frame = ttk.LabelFrame(main_frame, text="Filtros", padding="10")
