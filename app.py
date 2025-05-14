@@ -19,7 +19,7 @@ file_position = 0  # Posición en el archivo
 is_playing_file = False  # Estado de reproducción
 last_audio_chunk = np.zeros(block_size)  # Último chunk de audio (para el espectro)
 volume = 1.0  # Volumen (0.0 a 1.0)
-
+latency = 0.1 # Latencia en segundos
 # Diseño de los filtros
 b_low, a_low = signal.butter(4, 4000 / (fs / 2), 'low')  # Pasa-bajos (4kHz)
 b_high, a_high = signal.butter(4, 8000 / (fs / 2), 'high')  # Pasa-altos (8kHz)
@@ -32,54 +32,78 @@ b_custom, a_custom = signal.butter(2, fc_custom / (fs / 2), 'low')  # Filtro per
 def apply_filters(audio_data):
     """Aplica todos los filtros activos en cascada."""
     global fc_custom, b_custom, a_custom
-    audio = audio_data.copy()
+    
+    try:
+        # Convertimos a float32 para mejor rendimiento
+        audio = audio_data.astype(np.float32).copy()
 
-    # Aplica los filtros en orden (todos los que estén activos)
-    if var_lowpass.get():
-        audio = signal.lfilter(b_low, a_low, audio, axis=0)
-    if var_highpass.get():
-        audio = signal.lfilter(b_high, a_high, audio, axis=0)
-    if var_bandpass.get():
-        audio = signal.lfilter(b_band, a_band, audio, axis=0)
-    if var_bandstop.get():
-        audio = signal.lfilter(b_stop, a_stop, audio, axis=0)
-    if var_custom.get():
-        new_fc = slider_fc.get()
-        if new_fc != fc_custom:  # Recalcula solo si cambia la frecuencia
-            fc_custom = new_fc
-            b_custom, a_custom = signal.butter(2, fc_custom / (fs / 2), 'low')
-        audio = signal.lfilter(b_custom, a_custom, audio, axis=0)
+        # Aplicamos los filtros solo si hay señal
+        if not np.any(audio):
+            return audio
 
-    return audio * volume  # Aplica el volumen global
+        # Aplicamos los filtros en orden
+        if var_lowpass.get():
+            audio = signal.filtfilt(b_low, a_low, audio)
+        if var_highpass.get():
+            audio = signal.filtfilt(b_high, a_high, audio)
+        if var_bandpass.get():
+            audio = signal.filtfilt(b_band, a_band, audio)
+        if var_bandstop.get():
+            audio = signal.filtfilt(b_stop, a_stop, audio)
+        if var_custom.get():
+            new_fc = slider_fc.get()
+            if new_fc != fc_custom:
+                fc_custom = new_fc
+                b_custom, a_custom = signal.butter(2, fc_custom / (fs / 2), 'low')
+            audio = signal.filtfilt(b_custom, a_custom, audio)
 
+        # Aplicamos el volumen y prevenimos clipping
+        return np.clip(audio * volume, -1.0, 1.0)
+    
+    except Exception as e:
+        print(f"Error en apply_filters: {e}")
+        return audio_data
+    
 def audio_callback(indata, outdata, frames, time, status):
     """Callback para procesamiento de audio en tiempo real."""
     global file_position, audio_file, is_playing_file, last_audio_chunk
 
     if status:
-        print(f"Error en el stream: {status}")
-
-    if is_playing_file and audio_file is not None:
-        remaining_samples = len(audio_file) - file_position
-        if remaining_samples <= 0:
-            outdata[:] = np.zeros((frames, 1))
-            is_playing_file = False
-            btn_play_file.config(text="Reproducir Archivo")
+        # Solo imprimimos errores críticos
+        if status.input_overflow or status.output_underflow:
             return
-        chunk = audio_file[file_position:file_position + frames]
-        file_position += len(chunk)
-        if len(chunk) < frames:
-            chunk = np.pad(chunk, (0, frames - len(chunk)), 'constant', constant_values=0)  # Evita clicks
-        processed_audio = apply_filters(chunk)
+        print(f"Error crítico en el stream: {status}")
+
+    try:
+        if is_playing_file and audio_file is not None:
+            remaining_samples = len(audio_file) - file_position
+            if remaining_samples <= 0:
+                outdata.fill(0)
+                is_playing_file = False
+                root.after(0, lambda: btn_play_file.config(text="Reproducir Archivo"))
+                return
+            
+            chunk = audio_file[file_position:file_position + frames]
+            file_position += len(chunk)
+            if len(chunk) < frames:
+                chunk = np.pad(chunk, (0, frames - len(chunk)), 'constant')
+            processed_audio = apply_filters(chunk)
+            
+        else:
+            if np.any(indata):
+                processed_audio = apply_filters(indata[:, 0])
+            else:
+                outdata.fill(0)
+                return
+
+        # Prevenir clipping
+        processed_audio = np.clip(processed_audio, -1.0, 1.0)
         outdata[:] = processed_audio.reshape(-1, 1)
         last_audio_chunk = processed_audio
-    else:
-        if indata.any():
-            processed_audio = apply_filters(indata[:, 0])
-            outdata[:] = processed_audio.reshape(-1, 1)
-            last_audio_chunk = processed_audio
-        else:
-            outdata[:] = np.zeros((frames, 1))
+
+    except Exception as e:
+        outdata.fill(0)
+        print(f"Error en el procesamiento de audio: {e}")
 
 def load_audio_file():
     """Carga un archivo de audio y lo normaliza."""
@@ -126,16 +150,23 @@ def toggle_live_processing():
                 callback=audio_callback,
                 blocksize=block_size,
                 samplerate=fs,
-                channels=1
+                channels=1,
+                latency=latency,  # Añadimos latencia
+                device=None,  # Usar dispositivo por defecto
+                dtype=np.float32  # Especificamos el tipo de datos
             )
             stream.start()
             btn_live.config(text="Detener Micrófono")
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo iniciar el micrófono: {e}")
     else:
-        stream.stop()
-        stream = None
-        btn_live.config(text="Iniciar Micrófono")
+        try:
+            stream.stop()
+            stream.close()  # Agregamos close() para liberar recursos
+            stream = None
+            btn_live.config(text="Iniciar Micrófono")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al detener el micrófono: {e}")
 
 def export_audio():
     """Exporta el audio procesado a un archivo WAV."""
